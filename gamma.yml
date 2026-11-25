@@ -1,0 +1,310 @@
+name: Gamma Agent Runner
+
+# Gamma = a 6-agent task runner (Scout → Architect → Builder → QA → Reviewer → Explainer).
+#
+# Stage 1 (execute-gamma)      runs the agents and uploads the meeting brief, workspace and patch.
+# Stage 2 (publish-and-notify) waits behind the "gamma-approval-gate" environment, then opens a Draft PR.
+#
+# Setup guide: see README.md
+
+on:
+  # 1) Manual run from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      task_file:
+        description: "Path to a task file in this repo (e.g. tasks/01-welcome-audit.md)"
+        required: true
+        default: "tasks/01-welcome-audit.md"
+        type: string
+      delivery_mode:
+        description: "How should the result be delivered?"
+        required: true
+        default: "draft-pr"
+        type: choice
+        options:
+          - draft-pr
+          - issue
+          - artifact-only
+
+  # 2) Assigning an issue starts Gamma with the issue as the task.
+  #    Tip: set the repository variable GAMMA_ASSIGNEE to your GitHub username so only
+  #    assignments to YOU trigger a run (see README).
+  issues:
+    types: [assigned]
+
+  # 3) Recurring task (example — uncomment, then create the repository variable
+  #    GAMMA_SCHEDULED_TASK, e.g. tasks/weekly-docs-audit.md).
+  # schedule:
+  #   - cron: "0 6 * * 1"   # every Monday at 06:00 UTC
+
+# Least privilege by default; jobs raise it only where needed.
+permissions:
+  contents: read
+
+concurrency:
+  group: gamma-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1 — run the agents (read-only token, no ability to push)
+  # ---------------------------------------------------------------------------
+  execute-gamma:
+    name: "Stage 1 · Run Gamma agents"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # For issue events: only react when the assignee matches GAMMA_ASSIGNEE (if that variable is set).
+    if: ${{ github.event_name != 'issues' || vars.GAMMA_ASSIGNEE == '' || github.event.assignee.login == vars.GAMMA_ASSIGNEE }}
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      has_changes: ${{ steps.result.outputs.has_changes }}
+      title: ${{ steps.result.outputs.title }}
+      owners: ${{ steps.result.outputs.owners }}
+      delivery_mode: ${{ steps.result.outputs.delivery_mode }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false # agents' test commands never see a git token
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Check that ANTHROPIC_API_KEY is configured
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error title=Missing secret::Add ANTHROPIC_API_KEY under Settings → Secrets and variables → Actions → New repository secret."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund --no-package-lock
+
+      - name: Run Gamma
+        id: gamma
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GAMMA_TASK_FILE: ${{ inputs.task_file || vars.GAMMA_SCHEDULED_TASK || '' }}
+          GAMMA_DELIVERY_MODE: ${{ inputs.delivery_mode || vars.GAMMA_DELIVERY_MODE || 'draft-pr' }}
+          GAMMA_HAIKU_MODEL: ${{ vars.GAMMA_HAIKU_MODEL }}
+          GAMMA_SONNET_MODEL: ${{ vars.GAMMA_SONNET_MODEL }}
+          GAMMA_MAX_TOTAL_TOKENS: ${{ vars.GAMMA_MAX_TOTAL_TOKENS }}
+        run: node runner/gamma.mjs
+
+      - name: Read Gamma result
+        id: result
+        if: always()
+        run: |
+          f=".gamma-workspace/result.json"
+          if [ -f "$f" ]; then
+            echo "status=$(jq -r '.status' "$f")" >> "$GITHUB_OUTPUT"
+            echo "has_changes=$(jq -r '(.filesChanged | length) > 0' "$f")" >> "$GITHUB_OUTPUT"
+            echo "title=$(jq -r '.title | gsub("[\\r\\n]"; " ")' "$f")" >> "$GITHUB_OUTPUT"
+            echo "owners=$(jq -r '.owners | join(",")' "$f")" >> "$GITHUB_OUTPUT"
+            echo "delivery_mode=$(jq -r '.deliveryMode' "$f")" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "title=Gamma task" >> "$GITHUB_OUTPUT"
+            echo "owners=" >> "$GITHUB_OUTPUT"
+            echo "delivery_mode=draft-pr" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save git patch of Gamma's changes
+        if: ${{ steps.result.outputs.status == 'success' }}
+        run: |
+          mkdir -p artifacts
+          git add -A -- . ':(exclude).gamma-workspace' ':(exclude)artifacts' ':(exclude)node_modules' ':(exclude,glob)**/node_modules/**'
+          git diff --cached --binary > artifacts/gamma.patch
+          echo "Patch size: $(wc -c < artifacts/gamma.patch) bytes"
+          git diff --cached --stat
+
+      - name: Show meeting brief in the run summary
+        if: always()
+        run: |
+          if [ -f artifacts/meeting-brief.md ]; then
+            head -c 900000 artifacts/meeting-brief.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Gamma did not produce a meeting brief." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload meeting brief
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamma-meeting-brief
+          path: artifacts/meeting-brief.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload agent workspace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamma-workspace
+          path: .gamma-workspace/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload patch
+        if: ${{ steps.result.outputs.status == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamma-patch
+          path: artifacts/gamma.patch
+          if-no-files-found: error
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Stage 2 — human approval gate, then publish
+  # ---------------------------------------------------------------------------
+  # The `environment` below makes this job pause if you added "Required reviewers"
+  # to the "gamma-approval-gate" environment (README, step 5). If you did NOT
+  # configure it, GitHub creates the environment automatically and the job runs
+  # without pausing — the result is still only a DRAFT pull request that is
+  # assigned to you alone. Nothing is ever merged automatically.
+  publish-and-notify:
+    name: "Stage 2 · Approve & publish"
+    needs: execute-gamma
+    if: ${{ needs.execute-gamma.outputs.status == 'success' && needs.execute-gamma.outputs.delivery_mode != 'artifact-only' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: gamma-approval-gate
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GAMMA_TITLE: ${{ needs.execute-gamma.outputs.title }}
+      GAMMA_OWNERS: ${{ needs.execute-gamma.outputs.owners }}
+      MODE: ${{ needs.execute-gamma.outputs.delivery_mode }}
+      HAS_CHANGES: ${{ needs.execute-gamma.outputs.has_changes }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      BASE_BRANCH: ${{ github.event_name == 'issues' && github.event.repository.default_branch || github.ref_name }}
+      TAG_OWNERS: ${{ vars.GAMMA_TAG_OWNERS }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # Check out the exact commit Stage 1 worked on so the patch always applies.
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download meeting brief
+        uses: actions/download-artifact@v4
+        with:
+          name: gamma-meeting-brief
+          path: gamma-download/brief
+
+      - name: Download patch
+        if: ${{ env.HAS_CHANGES == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: gamma-patch
+          path: gamma-download/patch
+
+      - name: Re-scan patch for secrets and protected paths
+        if: ${{ env.HAS_CHANGES == 'true' }}
+        run: node runner/gamma.mjs --scan-patch gamma-download/patch/gamma.patch
+
+      - name: Commit to a branch and open a Draft Pull Request
+        if: ${{ env.MODE == 'draft-pr' && env.HAS_CHANGES == 'true' }}
+        run: |
+          set -euo pipefail
+
+          SLUG=$(printf '%s' "$GAMMA_TITLE" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed -E 's/-+/-/g; s/^-+//; s/-+$//' | cut -c1-40)
+          BRANCH="gamma/${SLUG:-task}-${GITHUB_RUN_ID}"
+
+          git config user.name "gamma-agent[bot]"
+          git config user.email "gamma-agent@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git apply --index --whitespace=nowarn gamma-download/patch/gamma.patch
+          git commit -m "gamma: ${GAMMA_TITLE}" -m "Generated by Gamma agent run: ${RUN_URL}"
+          git push origin "$BRANCH"
+
+          # Owners are only @-mentioned / requested as reviewers when GAMMA_TAG_OWNERS=true.
+          MENTIONS=""
+          for o in ${GAMMA_OWNERS//,/ }; do
+            [[ "$o" =~ ^[A-Za-z0-9-]+$ ]] || continue
+            if [ "${TAG_OWNERS:-}" = "true" ]; then MENTIONS="${MENTIONS} @${o}"; else MENTIONS="${MENTIONS} \`${o}\`"; fi
+          done
+
+          {
+            echo "## 🤖 Gamma draft pull request"
+            echo
+            echo "Generated by [Gamma run #${GITHUB_RUN_NUMBER}](${RUN_URL}). **Please review before merging — nothing is merged automatically.**"
+            echo
+            if [ -n "${ISSUE_NUMBER:-}" ]; then echo "Refs #${ISSUE_NUMBER}"; echo; fi
+            if [ -n "$MENTIONS" ]; then echo "Task owner(s):${MENTIONS}"; echo; fi
+            echo "---"
+            echo
+            head -c 50000 gamma-download/brief/meeting-brief.md
+          } > "$RUNNER_TEMP/pr-body.md"
+
+          if ! PR_URL=$(gh pr create --draft --base "$BASE_BRANCH" --head "$BRANCH" \
+                --title "Gamma: ${GAMMA_TITLE}" --body-file "$RUNNER_TEMP/pr-body.md" 2> "$RUNNER_TEMP/pr-error.txt"); then
+            cat "$RUNNER_TEMP/pr-error.txt"
+            echo "::error title=Could not open the pull request::Your branch '$BRANCH' WAS pushed. Open it manually: https://github.com/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${BRANCH}  — and enable Settings → Actions → General → 'Allow GitHub Actions to create and approve pull requests' (see README)."
+            exit 1
+          fi
+          echo "Draft PR: $PR_URL"
+          echo "### Draft PR created: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
+
+          # Assign to the person who started the run (safe default).
+          gh pr edit "$PR_URL" --add-assignee "$GITHUB_ACTOR" \
+            || echo "::warning::Could not assign $GITHUB_ACTOR to the PR."
+
+          # Optional: request reviews from the task owner(s).
+          if [ "${TAG_OWNERS:-}" = "true" ]; then
+            for o in ${GAMMA_OWNERS//,/ }; do
+              [[ "$o" =~ ^[A-Za-z0-9-]+$ ]] || continue
+              [ "$o" = "$GITHUB_ACTOR" ] && continue
+              gh pr edit "$PR_URL" --add-reviewer "$o" || echo "::warning::Could not request a review from $o."
+            done
+          fi
+
+          # If this run came from an issue, link the PR back to it.
+          if [ -n "${ISSUE_NUMBER:-}" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body "🤖 Gamma opened a draft PR for this issue: $PR_URL" \
+              || echo "::warning::Could not comment on issue #$ISSUE_NUMBER."
+          fi
+
+      - name: Post the briefing as an issue (or issue comment)
+        if: ${{ env.MODE == 'issue' || env.HAS_CHANGES != 'true' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## 🤖 Gamma result: ${GAMMA_TITLE}"
+            echo
+            echo "Workflow run: ${RUN_URL}"
+            echo
+            if [ "$HAS_CHANGES" = "true" ]; then
+              echo "Delivery mode is **issue**, so no branch or pull request was created. Download the \`gamma-patch\` artifact from the run above and apply it with \`git apply gamma.patch\`."
+            else
+              echo "Gamma produced no file changes for this task, so there is nothing to open a pull request for."
+            fi
+            echo
+            echo "---"
+            echo
+            head -c 55000 gamma-download/brief/meeting-brief.md
+          } > "$RUNNER_TEMP/issue-body.md"
+
+          if [ -n "${ISSUE_NUMBER:-}" ]; then
+            gh issue comment "$ISSUE_NUMBER" --body-file "$RUNNER_TEMP/issue-body.md"
+          else
+            gh issue create --title "Gamma: ${GAMMA_TITLE}" --body-file "$RUNNER_TEMP/issue-body.md" --assignee "$GITHUB_ACTOR" \
+              || gh issue create --title "Gamma: ${GAMMA_TITLE}" --body-file "$RUNNER_TEMP/issue-body.md"
+          fi
