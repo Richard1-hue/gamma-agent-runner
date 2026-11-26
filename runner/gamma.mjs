@@ -2,8 +2,8 @@
 /**
  * Gamma — runner/gamma.mjs
  *
- * Six-agent assembly line that runs inside GitHub Actions on GitHub Models
- * (OpenAI-compatible API, authenticated with the built-in GITHUB_TOKEN — no external API key):
+ * Six-agent assembly line that runs inside GitHub Actions on Groq
+ * (OpenAI-compatible API, free tier, authenticated with the GAMMA_API_KEY secret):
  *   1 Scout & Triage (fast model)  → .gamma-workspace/01-scout-brief.md
  *   2 Architect      (fast model)  → .gamma-workspace/02-task-spec.md
  *   3 Builder        (main model)  → edits files via tools (bounded ReAct loop)
@@ -16,16 +16,16 @@
  *   node runner/gamma.mjs --scan-patch <file>  DLP-scan a git patch (used by the publish job)
  *
  * Environment:
- *   GITHUB_TOKEN             required in Actions; needs "permissions: models: read"
+ *   GAMMA_API_KEY            required: your Groq API key (gsk_...), stored as a repository secret
  *   GAMMA_TASK_FILE          path to a task .md file (workflow_dispatch / schedule)
  *   GAMMA_DELIVERY_MODE      draft-pr | issue | artifact-only   (default draft-pr)
- *   GAMMA_FAST_MODEL         Scout + Architect model   (default openai/gpt-4.1-mini)
- *   GAMMA_MAIN_MODEL         Builder/QA/Reviewer/Explainer model (default openai/gpt-4.1)
+ *   GAMMA_FAST_MODEL         Scout + Architect model   (default openai/gpt-oss-20b)
+ *   GAMMA_MAIN_MODEL         Builder/QA/Reviewer/Explainer model (default openai/gpt-oss-120b)
  *   --- optional: switch provider -------------------------------------------------------
- *   GAMMA_BASE_URL           default https://models.github.ai/inference
- *   GAMMA_API_KEY            default: GITHUB_TOKEN
- *   --- optional: tuning (defaults are sized for the GitHub Models free tier) ----------
- *   GAMMA_INPUT_TOKEN_BUDGET (6500)  GAMMA_MAX_OUTPUT_TOKENS (per-agent, <=4000)  GAMMA_MAX_READ_CHARS (6000)
+ *   GAMMA_BASE_URL           default https://api.groq.com/openai/v1
+ *   GAMMA_REASONING_EFFORT   low | medium | high (gpt-oss models only, default low)
+ *   --- optional: tuning (defaults are sized for the Groq free tier (8,000 tokens/minute per model)) ----------
+ *   GAMMA_INPUT_TOKEN_BUDGET (4000)  GAMMA_MAX_OUTPUT_TOKENS (per-agent, <=4000)  GAMMA_MAX_READ_CHARS (6000)
  *   GAMMA_MIN_INTERVAL_MS    pause between calls per model (4000 fast / 6500 main; 0 = off)
  *   GAMMA_MAX_REQUESTS (100) GAMMA_MAX_TOTAL_TOKENS (2,000,000)
  *   GITHUB_EVENT_NAME / GITHUB_EVENT_PATH   set automatically by GitHub Actions
@@ -69,11 +69,12 @@ const envNum = (name, dflt) => {
 };
 
 const MODELS = {
-  fast: process.env.GAMMA_FAST_MODEL?.trim() || 'openai/gpt-4.1-mini', // Scout + Architect
-  main: process.env.GAMMA_MAIN_MODEL?.trim() || 'openai/gpt-4.1', // Builder, QA, Reviewer, Explainer
+  fast: process.env.GAMMA_FAST_MODEL?.trim() || 'openai/gpt-oss-20b', // Scout + Architect
+  main: process.env.GAMMA_MAIN_MODEL?.trim() || 'openai/gpt-oss-120b', // Builder, QA, Reviewer, Explainer
 };
-const BASE_URL = process.env.GAMMA_BASE_URL?.trim() || 'https://models.github.ai/inference';
-const INPUT_BUDGET = envNum('GAMMA_INPUT_TOKEN_BUDGET', 6500); // est. tokens per request (free tier limit is 8000)
+const BASE_URL = process.env.GAMMA_BASE_URL?.trim() || 'https://api.groq.com/openai/v1';
+const REASONING_EFFORT = process.env.GAMMA_REASONING_EFFORT?.trim() || 'low'; // gpt-oss reasoning tokens count against max_tokens
+const INPUT_BUDGET = envNum('GAMMA_INPUT_TOKEN_BUDGET', 4000); // est. input tokens per request; input + max output must stay under Groq's 8,000 tokens/minute free limit
 const rawInterval = (process.env.GAMMA_MIN_INTERVAL_MS ?? '').trim();
 const ENV_INTERVAL_MS = rawInterval !== '' && Number.isFinite(Number(rawInterval)) ? Number(rawInterval) : null;
 
@@ -82,12 +83,12 @@ const MAX_HEAL_ATTEMPTS = 2; // QA → Builder self-healing rounds
 const MAX_RETRIES = 8; // API retries (429 / 5xx / network) with backoff
 const MAX_REQUESTS = envNum('GAMMA_MAX_REQUESTS', 100); // hard cap on model calls per run
 const MAX_STEPS = { scout: 10, builder: 15, qa: 8 }; // hard cap per ReAct loop
-// Free tier allows at most 4,000 output tokens per request. GAMMA_MAX_OUTPUT_TOKENS overrides every agent.
+// Groq free tier: input + output must fit in 8,000 tokens/minute per model, so outputs are kept small. GAMMA_MAX_OUTPUT_TOKENS overrides every agent.
 const MAX_OUTPUT_TOKENS = process.env.GAMMA_MAX_OUTPUT_TOKENS?.trim()
-  ? Object.fromEntries(['scout', 'architect', 'builder', 'qa', 'reviewer', 'explainer'].map((k) => [k, envNum('GAMMA_MAX_OUTPUT_TOKENS', 3500)]))
-  : { scout: 2000, architect: 2500, builder: 3500, qa: 2000, reviewer: 3000, explainer: 3800 };
+  ? Object.fromEntries(['scout', 'architect', 'builder', 'qa', 'reviewer', 'explainer'].map((k) => [k, envNum('GAMMA_MAX_OUTPUT_TOKENS', 2500)]))
+  : { scout: 1800, architect: 2200, builder: 2800, qa: 1800, reviewer: 2200, explainer: 2800 };
 const TOKEN_BUDGET = envNum('GAMMA_MAX_TOTAL_TOKENS', 2_000_000);
-const DELIVERY_MODES = ['draft-pr', 'issue', 'artifact-only'];
+const DELIVERY_MODES = ['draft-pr', 'pr-and-issue', 'issue', 'artifact-only'];
 
 const SPEC_SECTIONS = [
   'Goal',
@@ -211,11 +212,11 @@ function assertGitRepo() {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Model client: GitHub Models (OpenAI-compatible), pacing, retries, budgets  */
+/* Model client: Groq (OpenAI-compatible), pacing, retries, budgets          */
 /* -------------------------------------------------------------------------- */
 //
-// GitHub Models' free tier is strict: ~8,000 input / 4,000 output tokens per request,
-// ~10-15 requests per minute and a daily request cap per model. This section keeps every
+// Groq's free tier is strict: ~8,000 tokens per minute (input + output) per model, 30 requests per
+// minute, and daily request/token caps per model. This section keeps every
 // request small (history trimming), spaces requests out (pacing), and retries 429 / 413 / 5xx.
 
 const MAX_RATE_LIMIT_WAIT_SECONDS = 180; // a longer wait almost certainly means the DAILY cap was hit
@@ -313,7 +314,7 @@ const backoffMs = (attempt) => Math.round(Math.min(90_000, 5_000 * 2 ** attempt)
 
 /** Space requests out so we stay under the per-minute limit of each model. */
 async function pace(model) {
-  const interval = ENV_INTERVAL_MS !== null ? ENV_INTERVAL_MS : model === MODELS.main ? 6_500 : 4_000;
+  const interval = ENV_INTERVAL_MS !== null ? ENV_INTERVAL_MS : model === MODELS.main ? 9_000 : 9_000;
   const wait = (state.lastCallAt[model] || 0) + interval - Date.now();
   if (wait > 0) await sleep(wait);
   state.lastCallAt[model] = Date.now();
@@ -343,6 +344,7 @@ async function chat({ name, model, system, messages, tools, toolChoice, maxToken
     try {
       state.attempts++;
       const body = { model, max_tokens: maxTokens, messages: [{ role: 'system', content: system }, ...messages] };
+      if (/gpt-oss/i.test(model)) body.reasoning_effort = REASONING_EFFORT;
       if (tools) {
         body.tools = tools;
         body.tool_choice = toolChoice || 'auto';
@@ -358,7 +360,7 @@ async function chat({ name, model, system, messages, tools, toolChoice, maxToken
         throw new HaltError(
           'error',
           `${name}: ${model} at ${BASE_URL} returned no choices (response type: ${typeof resp}). Raw response: ${oneLine(snippet, 500)}. ` +
-            'This usually means a wrong GAMMA_BASE_URL (it must be https://models.github.ai/inference, or unset), a wrong model ID, or an error body returned with HTTP 200.',
+            'This usually means a wrong GAMMA_BASE_URL (for Groq it must be https://api.groq.com/openai/v1, or unset), a wrong model ID, or an error body returned with HTTP 200.',
         );
       }
       state.usage.calls++;
@@ -382,7 +384,7 @@ async function chat({ name, model, system, messages, tools, toolChoice, maxToken
         if (wait && wait > MAX_RATE_LIMIT_WAIT_SECONDS) {
           throw new HaltError(
             'halted',
-            `GitHub Models rate limit reached for ${model}; it resets in about ${Math.ceil(wait / 60)} minutes (this is usually the free DAILY request cap). Re-run later, or set GAMMA_FAST_MODEL / GAMMA_MAIN_MODEL to other models, or switch provider (see README).`,
+            `Groq rate limit reached for ${model}; it resets in about ${Math.ceil(wait / 60)} minutes (this is usually the free DAILY token/request cap, 200,000 tokens per day per model). Re-run later, or set GAMMA_FAST_MODEL / GAMMA_MAIN_MODEL to other models, or switch provider (see README).`,
           );
         }
         if (attempt >= MAX_RETRIES) throw err;
@@ -1203,9 +1205,9 @@ async function writeFailureBrief(status, message) {
 /* -------------------------------------------------------------------------- */
 
 async function runPipeline() {
-  const apiKey = (process.env.GAMMA_API_KEY || process.env.GITHUB_TOKEN || '').trim();
+  const apiKey = (process.env.GAMMA_API_KEY || process.env.GROQ_API_KEY || '').trim();
   if (!apiKey) {
-    throw new HaltError('error', 'No token found. The workflow must pass GITHUB_TOKEN (env: GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}) and grant "permissions: models: read".');
+    throw new HaltError('error', 'No API key found. Create a free key at console.groq.com, add it as the repository secret GAMMA_API_KEY (Settings → Secrets and variables → Actions → Secrets), and re-run.');
   }
   assertGitRepo();
 
@@ -1222,7 +1224,7 @@ async function runPipeline() {
   } catch {
     throw new HaltError('error', 'The "openai" package is not installed. Run "npm install" before starting Gamma.');
   }
-  // GitHub Models speaks the OpenAI chat-completions protocol. To use another provider, change
+  // Groq speaks the OpenAI chat-completions protocol. To use another provider, change
   // baseURL and apiKey here (or set GAMMA_BASE_URL / GAMMA_API_KEY).
   state.client = new OpenAI({ baseURL: BASE_URL, apiKey, maxRetries: 0 }); // we do our own backoff
 
@@ -1333,12 +1335,12 @@ function friendlyError(err) {
   const s = err?.status;
   const detail = oneLine(err?.message, 200);
   if (s === 401 || s === 403) {
-    return `GitHub Models rejected the token (${s}). Check that the workflow grants "permissions: models: read" and, for organization repositories, that GitHub Models is enabled for the organization. (${detail})`;
+    return `Groq rejected the API key (${s}). Check that the repository secret GAMMA_API_KEY holds a valid key from console.groq.com (it starts with gsk_). (${detail})`;
   }
   if (s === 404 || /unknown.?model|model.*(not found|does not exist|unavailable)/i.test(err?.message || '')) {
-    return `Model or endpoint not found (${s ?? 'error'}): ${detail}. Set the repository variables GAMMA_FAST_MODEL / GAMMA_MAIN_MODEL to IDs from the GitHub Models catalog (format publisher/name, e.g. openai/gpt-4.1).`;
+    return `Model or endpoint not found (${s ?? 'error'}): ${detail}. Set the repository variables GAMMA_FAST_MODEL / GAMMA_MAIN_MODEL to model IDs available on your Groq account (e.g. openai/gpt-oss-120b).`;
   }
-  if (s === 429) return `GitHub Models rate limit still exceeded after all retries. Wait a few minutes (or until tomorrow if the daily cap was hit) and re-run. (${detail})`;
+  if (s === 429) return `Groq rate limit still exceeded after all retries. Wait a few minutes (or until tomorrow if the daily cap was hit) and re-run. (${detail})`;
   if (s === 413) return `The request was too large for the model's token limit even after shrinking it. Use a smaller task or fewer/smaller input files. (${detail})`;
   return `${err?.name ?? 'Error'}: ${err?.message ?? String(err)}`;
 }
