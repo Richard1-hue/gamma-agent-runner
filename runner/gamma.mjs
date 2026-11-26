@@ -839,7 +839,14 @@ function extractTestCommands(spec) {
   }
   const withoutFences = section.replace(/```[a-zA-Z]*\n[\s\S]*?```/g, '');
   for (const m of withoutFences.matchAll(/`([^`\n]+)`/g)) found.add(m[1].trim());
-  return [...found].filter((c) => validateCommand(c).ok).slice(0, 5);
+  // Defensive: if two commands were glued together ("node a.mjsnode a.mjs x"), split before the second runner.
+  const split = [...found]
+    .flatMap((c) => c.split(/(?<=\S)(?=(?:node|npm|npx|python3?|pytest)\s)/))
+    .map((c) => c.replace(/^[-*]\s+/, '').trim())
+    .filter(Boolean);
+  const commands = [...new Set(split)].filter((c) => validateCommand(c).ok).slice(0, 5);
+  log(`QA test commands extracted from spec: ${commands.length ? commands.map((c) => JSON.stringify(c)).join(', ') : '(none)'}`);
+  return commands;
 }
 
 function parseVerdict(text) {
