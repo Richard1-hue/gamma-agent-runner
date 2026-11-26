@@ -391,10 +391,42 @@ async function chat({ name, model, system, messages, tools, toolChoice, maxToken
 }
 
 /** One-shot completion (no tools). */
+const MAX_EMPTY_RETRIES = 2; // extra attempts when the model returns empty text
+
 async function ask({ name, model, system, user, maxTokens }) {
-  const resp = await chat({ name, model, system, messages: [{ role: 'user', content: user }], maxTokens });
-  const choice = resp.choices?.[0];
-  return { text: messageText(choice?.message), truncated: choice?.finish_reason === 'length' };
+  let prompt = user;
+  let last = { text: '', truncated: false };
+
+  for (let attempt = 0; attempt <= MAX_EMPTY_RETRIES; attempt++) {
+    const resp = await chat({ name, model, system, messages: [{ role: 'user', content: prompt }], maxTokens });
+    const choice = resp.choices?.[0];
+    const msg = choice?.message;
+    const text = messageText(msg);
+    last = { text, truncated: choice?.finish_reason === 'length' };
+    if (text) return last;
+
+    // Empty response: make the reason visible in the Actions log.
+    const u = resp.usage || {};
+    log(
+      `${name}: EMPTY response from ${model} (attempt ${attempt + 1}/${MAX_EMPTY_RETRIES + 1}) — ` +
+        `finish_reason=${choice?.finish_reason ?? 'none'}, refusal=${oneLine(msg?.refusal, 200) || 'none'}, ` +
+        `content_type=${msg?.content === null ? 'null' : typeof msg?.content}, choices=${resp.choices?.length ?? 0}, ` +
+        `prompt_tokens=${u.prompt_tokens ?? '?'}, completion_tokens=${u.completion_tokens ?? '?'}, ` +
+        `system_chars=${system.length}, user_chars=${prompt.length}`,
+    );
+
+    if (attempt < MAX_EMPTY_RETRIES) {
+      // Trim the user prompt by 30% in case of silent token-limit truncation.
+      const keep = Math.max(500, Math.floor(prompt.length * 0.7));
+      if (keep < prompt.length) {
+        // Keep the closing instruction (e.g. "Write the specification now.") intact.
+        const tail = prompt.slice(-200);
+        prompt = `${prompt.slice(0, Math.max(300, keep - 200))}\n…[truncated after an empty model response]\n\n${tail}`;
+      }
+      log(`${name}: retrying with a ${prompt.length}-char prompt.`);
+    }
+  }
+  return last;
 }
 
 function parseToolArgs(raw) {
@@ -664,24 +696,25 @@ async function agentArchitect(trigger, scoutBrief) {
   group('Agent 2 — Architect (fast model)');
   const user = [
     '<task_input>',
-    truncate(trigger.raw, 4_000),
+    truncate(trigger.raw, 2_500),
     '</task_input>',
     '',
     '<scout_brief>',
-    untrusted('scout-brief', truncate(scoutBrief, 6_000)),
+    untrusted('scout-brief', truncate(scoutBrief, 3_000)),
     '</scout_brief>',
     '',
     'Write the specification now.',
   ].join('\n');
 
-  const { text } = await ask({
-    name: 'architect',
-    model: MODELS.fast,
-    system: systemFor(ARCHITECT_ROLE),
-    user,
-    maxTokens: MAX_OUTPUT_TOKENS.architect,
-  });
-  if (!text) throw new HaltError('error', 'The Architect agent returned an empty specification.');
+  const run = (model) =>
+    ask({ name: 'architect', model, system: systemFor(ARCHITECT_ROLE), user, maxTokens: MAX_OUTPUT_TOKENS.architect });
+
+  let { text } = await run(MODELS.fast);
+  if (!text && MODELS.main !== MODELS.fast) {
+    log(`architect: ${MODELS.fast} returned empty after retries — falling back to ${MODELS.main}.`);
+    ({ text } = await run(MODELS.main));
+  }
+  if (!text) throw new HaltError('error', 'The Architect agent returned an empty specification (fast model and main-model fallback both failed). See the "EMPTY response" log lines above for finish_reason and token details.');
   const spec = normalizeSpec(stripOuterFence(text), trigger.title);
   await writeWs('02-task-spec.md', spec);
   endGroup();
