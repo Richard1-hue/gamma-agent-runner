@@ -1,7 +1,8 @@
 name: Gamma Agent Runner
 
 # Gamma = a 6-agent task runner (Scout → Architect → Builder → QA → Reviewer → Explainer).
-# It runs on GitHub Models using the built-in GITHUB_TOKEN — no API key, no extra secrets.
+# It runs on Groq's free tier. Create a key at console.groq.com and store it as the repository
+# secret GAMMA_API_KEY (Settings → Secrets and variables → Actions → Secrets).
 #
 # Stage 1 (execute-gamma)      runs the agents and uploads the meeting brief, workspace and patch.
 # Stage 2 (publish-and-notify) waits behind the "gamma-approval-gate" environment, then opens a Draft PR.
@@ -40,10 +41,8 @@ on:
   #   - cron: "0 6 * * 1"   # every Monday at 06:00 UTC
 
 # Least privilege by default; jobs raise it only where needed.
-# `models: read` is what lets the built-in GITHUB_TOKEN call GitHub Models.
 permissions:
   contents: read
-  models: read
 
 concurrency:
   group: gamma-${{ github.event.issue.number || github.run_id }}
@@ -61,7 +60,6 @@ jobs:
     if: ${{ github.event_name != 'issues' || vars.GAMMA_ASSIGNEE == '' || github.event.assignee.login == vars.GAMMA_ASSIGNEE }}
     permissions:
       contents: read
-      models: read
     outputs:
       status: ${{ steps.result.outputs.status }}
       has_changes: ${{ steps.result.outputs.has_changes }}
@@ -85,16 +83,16 @@ jobs:
       - name: Run Gamma
         id: gamma
         env:
-          # Built-in token: no secret to create. Needs `models: read` (see permissions above).
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GAMMA_TASK_FILE: ${{ inputs.task_file || vars.GAMMA_SCHEDULED_TASK || '' }}
           GAMMA_DELIVERY_MODE: ${{ inputs.delivery_mode || vars.GAMMA_DELIVERY_MODE || 'draft-pr' }}
           # Optional overrides (repository Variables). Leave unset to use the defaults.
           GAMMA_FAST_MODEL: ${{ vars.GAMMA_FAST_MODEL }}
           GAMMA_MAIN_MODEL: ${{ vars.GAMMA_MAIN_MODEL }}
-          # Optional: switch to another OpenAI-compatible provider (see README).
-          GAMMA_BASE_URL: ${{ vars.GAMMA_BASE_URL }}
+          # Groq API key (required). The GitHub token is deliberately NOT passed to the agents.
           GAMMA_API_KEY: ${{ secrets.GAMMA_API_KEY }}
+          # Optional: another OpenAI-compatible provider (default is Groq).
+          GAMMA_BASE_URL: ${{ vars.GAMMA_BASE_URL }}
+          GAMMA_REASONING_EFFORT: ${{ vars.GAMMA_REASONING_EFFORT }}
           # Optional tuning (defaults fit the GitHub Models free tier).
           GAMMA_INPUT_TOKEN_BUDGET: ${{ vars.GAMMA_INPUT_TOKEN_BUDGET }}
           GAMMA_MAX_OUTPUT_TOKENS: ${{ vars.GAMMA_MAX_OUTPUT_TOKENS }}
@@ -188,7 +186,6 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
-      models: read
     env:
       GH_TOKEN: ${{ github.token }}
       GAMMA_TITLE: ${{ needs.execute-gamma.outputs.title }}
