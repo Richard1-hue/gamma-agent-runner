@@ -348,6 +348,19 @@ async function chat({ name, model, system, messages, tools, toolChoice, maxToken
         body.tool_choice = toolChoice || 'auto';
       }
       const resp = await state.client.chat.completions.create(body);
+      if (!resp || !Array.isArray(resp.choices) || resp.choices.length === 0) {
+        let snippet;
+        try {
+          snippet = typeof resp === 'string' ? resp : JSON.stringify(resp);
+        } catch {
+          snippet = String(resp);
+        }
+        throw new HaltError(
+          'error',
+          `${name}: ${model} at ${BASE_URL} returned no choices (response type: ${typeof resp}). Raw response: ${oneLine(snippet, 500)}. ` +
+            'This usually means a wrong GAMMA_BASE_URL (it must be https://models.github.ai/inference, or unset), a wrong model ID, or an error body returned with HTTP 200.',
+        );
+      }
       state.usage.calls++;
       state.usage.input += resp.usage?.prompt_tokens || 0;
       state.usage.output += resp.usage?.completion_tokens || 0;
@@ -1218,7 +1231,7 @@ async function runPipeline() {
   state.trigger = trigger;
   state.title = trigger.title;
   await writeWs('00-task-input.md', `<!-- ${trigger.meta} -->\n\n${trigger.raw}\n`);
-  log(`Trigger: ${trigger.label} | delivery: ${state.deliveryMode} | models: ${MODELS.fast} / ${MODELS.main}`);
+  log(`Trigger: ${trigger.label} | delivery: ${state.deliveryMode} | models: ${MODELS.fast} / ${MODELS.main} | base URL: ${BASE_URL}`);
 
   // Agent 1 & 2
   const scout = await agentScout(trigger);
