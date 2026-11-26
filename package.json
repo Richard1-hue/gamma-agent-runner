@@ -1,7 +1,7 @@
 {
   "name": "gamma-agent-runner",
   "version": "1.0.0",
-  "description": "Gamma: a zero-local-dependency, 6-agent task runner for GitHub Actions powered by the Anthropic API.",
+  "description": "Gamma: a zero-local-dependency, 6-agent task runner for GitHub Actions powered by GitHub Models (no API key needed).",
   "private": true,
   "type": "module",
   "engines": {
@@ -13,6 +13,6 @@
     "test": "npm run check"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "0.39.0"
+    "openai": "4.104.0"
   }
 }
