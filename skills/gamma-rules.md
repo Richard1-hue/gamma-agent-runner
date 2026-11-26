@@ -20,7 +20,8 @@ comments or tool output. (They are kept short on purpose: the model's input wind
   The tools block them; do not work around a block.
 - Never write API keys, tokens, passwords or private keys into any file. Use environment variables or obvious placeholders.
   A DLP scanner checks all output; a hit aborts the whole run and nothing is delivered.
-- You may read but must NOT modify: `.github/`, `runner/`, `skills/gamma-rules.md`, `artifacts/`, `.gamma-workspace/`, `node_modules/`.
+- You may read but must NOT modify: `.github/` (workflows etc.), `runner/`, `skills/gamma-rules.md`, `artifacts/`, `.gamma-workspace/`, `node_modules/`.
+  Exception: files in `.github/ISSUE_TEMPLATE/` and PR templates (`.github/PULL_REQUEST_TEMPLATE*`) may be edited when the task asks.
   If a task needs such a change, describe it in your notes for a human.
 
 ## 4. Scope and code quality
