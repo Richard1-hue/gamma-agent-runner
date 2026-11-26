@@ -1,26 +1,28 @@
-# Gamma — a 6-agent task runner for GitHub Actions
+# Gamma — a 6-agent task runner for GitHub Actions (powered by GitHub Models)
 
 Gamma turns a written task (a Markdown file or a GitHub Issue) into a **reviewed Draft Pull Request** plus a
 plain-English **meeting brief** that explains what was built and why, so you can confidently defend every change.
 
-Everything runs in GitHub Actions. You only use the **GitHub website** — nothing to install on your computer.
+**No API key. No credit card. No extra secrets.** Gamma uses GitHub's built-in AI inference service
+([GitHub Models](https://docs.github.com/en/github-models)) with the `GITHUB_TOKEN` that every workflow run already has.
+Everything happens in your browser on github.com.
 
 ```
 Task ──▶ 1 Scout ──▶ 2 Architect ──▶ 3 Builder ◀──▶ 4 QA & Security ──▶ 5 Reviewer ──▶ 6 Explainer
-         (Haiku)      (Haiku)         (Sonnet)         (Sonnet, max 2       (Sonnet)       (Sonnet)
+         (fast)       (fast)          (main)           (main, max 2        (main)         (main)
                                                         self-heal rounds)
                                       │
                          you review meeting-brief.md ──▶ approve ──▶ Draft PR
 ```
 
-| Agent | Model | What it does |
+| Agent | Model (default) | What it does |
 |---|---|---|
-| 1 Scout & Triage | Haiku | Reads the task, scans the repo (ignores `.git`, `node_modules`, lockfiles, binaries, secrets), writes `01-scout-brief.md` |
-| 2 Architect | Haiku | Turns the task + brief into a strict spec: `02-task-spec.md` |
-| 3 Builder | Sonnet | Edits files with sandboxed tools (max 15 steps per loop) following `skills/gamma-rules.md` |
-| 4 QA & Security | Sonnet | Runs the spec's tests, scans for leaked secrets, checks completion criteria; sends failures back to the Builder up to 2 times |
-| 5 Code Reviewer | Sonnet | Audits the `git diff` against the requirements: `03-review.md` |
-| 6 Meeting Prep & Explainer | Sonnet | Writes `artifacts/meeting-brief.md` (What was built · Why · Requirement checklist · Likely review questions) |
+| 1 Scout & Triage | `openai/gpt-4.1-mini` | Reads the task, scans the repo (ignores `.git`, `node_modules`, lockfiles, binaries, secrets), writes `01-scout-brief.md` |
+| 2 Architect | `openai/gpt-4.1-mini` | Turns the task + brief into a strict spec: `02-task-spec.md` |
+| 3 Builder | `openai/gpt-4.1` | Edits files with sandboxed tools (max 15 steps per loop) following `skills/gamma-rules.md` |
+| 4 QA & Security | `openai/gpt-4.1` | Runs the spec's tests, scans for leaked secrets, checks completion criteria; sends failures back to the Builder up to 2 times |
+| 5 Code Reviewer | `openai/gpt-4.1` | Audits the `git diff` against the requirements: `03-review.md` |
+| 6 Meeting Prep & Explainer | `openai/gpt-4.1` | Writes `artifacts/meeting-brief.md` (What was built · Why · Requirement checklist · Likely review questions) |
 
 ---
 
@@ -28,9 +30,9 @@ Task ──▶ 1 Scout ──▶ 2 Architect ──▶ 3 Builder ◀──▶ 4 
 
 ```
 README.md                        ← you are here
-package.json                     ← one dependency: @anthropic-ai/sdk
+package.json                     ← one dependency: openai (the client library; it talks to GitHub Models)
 .github/workflows/gamma.yml      ← the GitHub Actions workflow
-runner/gamma.mjs                 ← the orchestrator (6 agents, retries, DLP)
+runner/gamma.mjs                 ← the orchestrator (6 agents, retries, pacing, DLP)
 runner/tools.mjs                 ← sandboxed file tools + security checks
 skills/gamma-rules.md            ← rules every agent must follow
 tasks/TEMPLATE.md                ← blank task template
@@ -39,71 +41,70 @@ tasks/01-welcome-audit.md        ← ready-to-run sample task
 
 ---
 
-## Setup (about 10 minutes, all in your browser)
+## Setup (about 5 minutes, all in your browser)
 
-### Step 1 — Get an Anthropic API key
-1. Go to <https://console.anthropic.com/> and sign in.
-2. Open **API Keys → Create Key**. Copy the key (it starts with `sk-ant-`). You will not see it again.
-3. Make sure the account has credits (a free-trial / Tier 1 account is fine for the sample task).
+### Step 1 — Put the Gamma files in a GitHub repository
+1. On GitHub click **+ → New repository**. Name it (e.g. `gamma-playground`), choose **Private** or **Public**, click **Create repository**.
+2. **Unzip** the download on your computer.
+3. In your repository click **Add file → Upload files**, drag **everything inside** the unzipped folder
+   (`README.md`, `package.json`, `runner`, `skills`, `tasks`, and the `.github` folder) into the page, then **Commit changes**.
 
-### Step 2 — Put the Gamma files in a GitHub repository
-1. On GitHub click **+ → New repository**. Name it (e.g. `gamma-playground`), choose **Private**, tick
-   **Add a README file** only if you want one, and click **Create repository**.
-   (You can also use an existing repository — see *Using an existing repo* below.)
-2. **Unzip** `gamma-agent-runner.zip` on your computer.
-3. In your repository click **Add file → Upload files**.
-4. Open the unzipped folder and **drag everything inside it** (`README.md`, `package.json`, `runner`, `skills`,
-   `tasks`, and the `.github` folder) into the browser window. Wait until every file is listed, then click **Commit changes**.
+> ⚠️ **The `.github` folder is hidden** on macOS and Windows, so it may not show in the file picker. If
+> `.github/workflows/gamma.yml` is missing from your repository afterwards, add it by hand:
+> **Add file → Create new file**, type exactly `.github/workflows/gamma.yml` in the name box (typing `/` creates folders),
+> paste the contents of `gamma.yml`, and **Commit changes**.
+>
+> You can also create every file this way: copy and paste each file's contents into **Add file → Create new file**.
 
-> ⚠️ **The `.github` folder is hidden** on macOS and Windows, so you may not see it in the file picker.
-> Dragging the whole unzipped folder usually works. If `.github/workflows/gamma.yml` does not show up in your
-> repository, add it by hand:
-> 1. **Add file → Create new file**.
-> 2. In the name box type exactly `.github/workflows/gamma.yml` (typing the `/` creates the folders).
-> 3. Paste the contents of `gamma.yml`, then **Commit changes**.
-
-Check that your repository now contains `.github/workflows/gamma.yml`, `runner/`, `skills/`, `tasks/` and `package.json`.
-
-### Step 3 — Add your API key as a secret
-1. In your repository open **Settings → Secrets and variables → Actions**.
-2. Click **New repository secret**.
-3. Name: `ANTHROPIC_API_KEY` (exactly, capital letters). Secret: paste your key. Click **Add secret**.
-
-### Step 4 — Allow the workflow to open Pull Requests
+### Step 2 — Turn on Read and write permissions
 1. Open **Settings → Actions → General**.
-2. Scroll to **Workflow permissions**.
-3. Select **Read and write permissions**.
-4. Tick **Allow GitHub Actions to create and approve pull requests**.
-5. Click **Save**.
+2. Under **Workflow permissions** select **Read and write permissions**.
+3. Tick **Allow GitHub Actions to create and approve pull requests**.
+4. Click **Save**.
 
-> If you skip this, Gamma still works: it pushes a branch and tells you the link to open the PR yourself.
+That's the only setting required. There is **no secret to create** — Gamma authenticates with the built-in `GITHUB_TOKEN`,
+and the workflow file already requests the `models: read` permission it needs.
 
-### Step 5 — (Optional but recommended) Create the approval gate
-This makes Stage 2 **pause** until you have read the meeting brief.
+### Step 3 — Run the sample task
+1. Open the **Actions** tab (click **I understand my workflows, go ahead and enable them** if asked).
+2. Click **Gamma Agent Runner** in the left list → **Run workflow**.
+3. Keep `task_file` = `tasks/01-welcome-audit.md` and `delivery_mode` = `draft-pr`, click the green **Run workflow** button.
+4. Click the new run to watch it (Stage 1 takes about 3–8 minutes — see *Free tier limits* below for why).
+5. When Stage 1 is green, open the run **Summary** (the meeting brief is shown there) or download the **`gamma-meeting-brief`** artifact. Read it.
+6. Stage 2 then opens a **Draft Pull Request** (or pauses for your approval if you did the optional step below).
+7. Open **Pull requests**, review *Files changed*, then merge or close it.
 
-1. Open **Settings → Environments → New environment**.
-2. Name it exactly `gamma-approval-gate` and click **Configure environment**.
-3. Tick **Required reviewers**, add yourself (and teammates), click **Save protection rules**.
-   *(On private repositories this needs GitHub Pro/Team; on public repositories it is free.)*
-4. *(Optional)* To let Gamma request reviews from the `## Task owner` handles, add a repository variable:
-   **Settings → Secrets and variables → Actions → Variables → New repository variable**,
-   Name `GAMMA_TAG_OWNERS`, Value `true`.
+### Optional — an approval gate (pause before the PR is created)
+1. **Settings → Environments → New environment**, name it exactly `gamma-approval-gate`.
+2. Tick **Required reviewers**, add yourself, **Save protection rules**. *(Private repos need GitHub Pro/Team for this; public repos are free.)*
+3. *(Optional)* To let Gamma request reviews from `## Task owner` handles, add the repository **variable** `GAMMA_TAG_OWNERS` = `true`.
 
-**If you do not create the environment** (fallback): the first run creates it automatically with no reviewers,
-so Stage 2 does not pause. That is still safe — the result is a **Draft PR assigned only to the person who started
-the run**, owners are written as plain text (not @-mentioned), and nothing is ever merged automatically.
-If you want to remove the gate entirely, delete the `environment: gamma-approval-gate` line from the workflow.
+**Without the gate** (default): the first run creates the environment automatically with no reviewers, so Stage 2 does not pause.
+The result is still a **Draft PR assigned only to the person who started the run**; owners are written as plain text (not @-mentioned) and
+nothing is ever merged automatically. To remove the gate entirely, delete the `environment: gamma-approval-gate` line from the workflow
+(do this too if Stage 2 errors about environments on a private repo on the Free plan).
 
-### Step 6 — Run the sample task
-1. Open the **Actions** tab. If asked, click **I understand my workflows, go ahead and enable them**.
-2. In the left list click **Gamma Agent Runner**.
-3. Click **Run workflow**. Keep `task_file` = `tasks/01-welcome-audit.md` and `delivery_mode` = `draft-pr`. Click the green **Run workflow** button.
-4. Click the new run to watch it. Stage 1 takes roughly 2–6 minutes.
-5. When Stage 1 is green, scroll down the run page to **Artifacts** and download **`gamma-meeting-brief`** (also shown at the top of the run page under *Summary*). Read it.
-6. If you created the approval gate, Stage 2 shows **Waiting** → click **Review deployments**, tick `gamma-approval-gate`, and click **Approve and deploy**.
-7. Open the **Pull requests** tab: you will see a **Draft** PR with the briefing in its description. Review the *Files changed*, then merge it, or close it.
+> **Draft PRs on private repos (GitHub Free):** GitHub may not offer *draft* PRs there. Gamma then automatically opens a regular PR
+> titled `[Review required] …` — never merge it before reading the brief.
 
-🎉 That's it. Gamma works.
+---
+
+## Free tier limits — what to expect
+
+GitHub Models is free but rate-limited. Gamma is built around those limits:
+
+| Limit (free tier, per model) | Typical value | How Gamma copes |
+|---|---|---|
+| Tokens per request | ~8,000 in / ~4,000 out | Input is kept under ~6,500 estimated tokens: file reads capped at ~6,000 characters, old tool results trimmed, oldest steps dropped, outputs capped below 4,000 tokens |
+| Requests per minute | ~10 (strong models), ~15 (small models) | Calls are spaced out automatically (about 6.5 s / 4 s apart), so runs take a few minutes |
+| Requests per day | roughly 50–150 depending on model and Copilot plan | A run uses ~10–40 calls. If the daily cap is hit, Gamma stops with a clear message and nothing is delivered — re-run later |
+| `429` / `413` errors | — | Automatic retries with backoff; `retry-after` is honored; `413` retries with a smaller input |
+
+Practical advice:
+- **Keep tasks small** (a few files, each a few hundred lines at most). Big multi-file refactors do not fit in an 8k-token window.
+- The reviewer sees roughly the first ~9,000 characters of the diff; larger diffs are reviewed only partially (the brief says so).
+- Exact limits depend on your GitHub plan and change over time — see
+  [GitHub Models rate limits](https://docs.github.com/en/github-models/use-github-models/prototyping-with-ai-models#rate-limits).
 
 ---
 
@@ -114,26 +115,24 @@ If you want to remove the gate entirely, delete the `environment: gamma-approval
 2. **Actions → Gamma Agent Runner → Run workflow**, type `tasks/my-task.md`.
 
 ### Option B — assign a GitHub Issue
-1. Create an issue; describe the task (the Architect structures it for you, using the template sections helps).
-2. Assign it to yourself. Gamma starts automatically and comments on the issue with the PR link.
-3. **Recommended:** set a repository variable `GAMMA_ASSIGNEE` = your GitHub username. Then only assignments to
-   *you* trigger runs (otherwise any assignment does, which can burn credits).
+1. Create an issue describing the task and assign it to yourself. Gamma starts and comments on the issue with the PR link.
+2. **Recommended:** set a repository variable `GAMMA_ASSIGNEE` = your GitHub username so only assignments to *you* trigger runs.
 
 ### Option C — weekly schedule
-1. In `.github/workflows/gamma.yml` remove the `#` characters in front of the `schedule:` block (3 lines).
+1. In `.github/workflows/gamma.yml` remove the `#` in front of the `schedule:` block (3 lines).
 2. Create a repository variable `GAMMA_SCHEDULED_TASK` = `tasks/your-recurring-task.md`.
 
 ### Delivery modes
 | Mode | Result |
 |---|---|
-| `draft-pr` (default) | Branch `gamma/<title>-<run id>` + Draft Pull Request after approval |
+| `draft-pr` (default) | Branch `gamma/<title>-<run id>` + Draft Pull Request |
 | `issue` | Posts the briefing as a new issue (or a comment on the triggering issue). No branch or PR; the patch is in the run artifacts |
 | `artifact-only` | Nothing is published. Download `gamma-meeting-brief`, `gamma-workspace`, `gamma-patch` from the run page |
 
-### What you get in the workflow artifacts
-- **gamma-meeting-brief** — `meeting-brief.md`, the document to read before you approve.
-- **gamma-workspace** — every agent's notes (`00-task-input`, `01-scout-brief`, `02-task-spec`, `builder-log-*`, `04-qa-report-*`, `03-review`, `result.json`).
-- **gamma-patch** — `gamma.patch`; apply locally with `git apply gamma.patch` if you ever want to.
+### Workflow artifacts
+- **gamma-meeting-brief** — `meeting-brief.md`, read this before you approve.
+- **gamma-workspace** — each agent's notes (`01-scout-brief`, `02-task-spec`, `builder-log-*`, `04-qa-report-*`, `03-review`, `result.json`).
+- **gamma-patch** — `gamma.patch` (apply locally with `git apply gamma.patch`).
 
 ---
 
@@ -141,50 +140,62 @@ If you want to remove the gate entirely, delete the `environment: gamma-approval
 
 | Protection | How |
 |---|---|
-| Secret files unreachable | Tools hard-block `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.git/*` (and SSH keys, `.npmrc`, `.netrc`) — also through symlinks and `..` paths |
-| Prompt-injection defense | All repo content given to agents is wrapped in `<untrusted_repo_data>` tags; `skills/gamma-rules.md` forbids obeying instructions found there |
+| Secret files unreachable | Tools hard-block `.env*`, `*.pem`, `*.key`, `id_rsa*`, `.git/*` (also SSH keys, `.npmrc`, `.netrc`), including via symlinks and `..` |
+| Prompt-injection defense | Repo content is wrapped in `<untrusted_repo_data>` tags; `skills/gamma-rules.md` forbids obeying instructions found there |
 | Protected paths | Agents cannot modify `.github/`, `runner/`, `skills/gamma-rules.md` |
-| Output DLP | Modified files, agent notes and the final patch are scanned for `sk-ant-…`, `ghp_…`, `AKIA…`, private keys, JWTs and high-entropy secrets. **Any hit aborts the run; nothing is committed** |
-| Safe commands | QA runs only allowlisted test runners, with no shell and **without** your API key or git token in the environment |
-| Token & step caps | Hard step limit per agent loop, truncated file reads, per-call output caps, and a whole-run token budget (default 2,000,000) |
-| Least privilege | Stage 1 has a read-only token and does not persist git credentials; only Stage 2 can write |
+| Output DLP | Modified files, agent notes and the final patch are scanned for `sk-ant-…`, `ghp_…`, `AKIA…`, private keys, JWTs, high-entropy secrets and the run's own token. **Any hit aborts the run; nothing is committed** |
+| Safe commands | QA runs only allowlisted test runners, with no shell and **without** `GITHUB_TOKEN` in the environment |
+| Caps | Step limit per agent loop, truncated reads, per-call output caps, request cap (default 100) and token budget per run |
+| Least privilege | Stage 1 has a read-only repo token (+ `models: read`) and does not persist git credentials; only Stage 2 can write |
 | Human in the loop | Draft PRs only; nothing merges automatically |
 
 ---
 
-## Settings you can change (repository *Variables*)
+## Optional settings (repository *Variables*)
 
-Settings → Secrets and variables → Actions → **Variables**:
+**Settings → Secrets and variables → Actions → Variables**:
 
 | Variable | Purpose |
 |---|---|
+| `GAMMA_FAST_MODEL` | Scout + Architect model (default `openai/gpt-4.1-mini`) |
+| `GAMMA_MAIN_MODEL` | Builder, QA, Reviewer, Explainer model (default `openai/gpt-4.1`) |
 | `GAMMA_ASSIGNEE` | Only run for issues assigned to this username |
 | `GAMMA_SCHEDULED_TASK` | Task file used by the schedule trigger |
 | `GAMMA_DELIVERY_MODE` | Default delivery mode for non-manual runs |
 | `GAMMA_TAG_OWNERS` | `true` = @-mention task owners and request their review |
-| `GAMMA_HAIKU_MODEL` | Override the Haiku model id (default `claude-haiku-4-5-20251001`) |
-| `GAMMA_SONNET_MODEL` | Override the Sonnet model id (default `claude-sonnet-4-6`) |
+| `GAMMA_MAX_REQUESTS` | Max model calls per run (default `100`) |
 | `GAMMA_MAX_TOTAL_TOKENS` | Whole-run token cap (default `2000000`) |
+
+Model IDs use the form `publisher/name` (for example `openai/gpt-4.1`). The available list is in the
+[GitHub Models marketplace](https://github.com/marketplace/models). Models change over time; if a default is retired,
+a run fails with "model not found" — just set the variable to another ID.
 
 ---
 
-## Free-trial / Tier 1 notes
+## Switching to a paid provider later (higher token limits)
 
-- Gamma retries automatically on `429` rate-limit errors, honoring the `retry-after` header and backing off
-  exponentially (up to 8 retries). On a low tier a run can simply take longer — watch for lines like
-  `retry 2/8 in 12s` in the log. That is normal.
-- Keep tasks small and specific for the cheapest, fastest runs. The sample task is intentionally tiny.
-- If a run ends with a rate-limit error after all retries, wait a few minutes and use **Re-run all jobs**.
+Gamma talks to any **OpenAI-compatible** chat-completions API, so switching is just a base URL and a key:
+
+**No code change (recommended):**
+1. Add a repository **secret** `GAMMA_API_KEY` with your provider's key.
+2. Add repository **variables** `GAMMA_BASE_URL` (for example `https://api.openai.com/v1`) and the model IDs
+   `GAMMA_FAST_MODEL` / `GAMMA_MAIN_MODEL` in that provider's naming (for example `gpt-4.1-mini` / `gpt-4.1`).
+3. Optional: raise the limits that exist only for the free tier —
+   `GAMMA_INPUT_TOKEN_BUDGET=24000`, `GAMMA_MAX_OUTPUT_TOKENS=8000`, `GAMMA_MAX_READ_CHARS=20000`, `GAMMA_MIN_INTERVAL_MS=0`.
+
+**Or edit the code:** in `runner/gamma.mjs` find `new OpenAI({ baseURL: BASE_URL, apiKey, maxRetries: 0 })` and change `baseURL` and `apiKey`.
+
+(Paid usage of GitHub Models itself is also possible: opt in under your account/organization billing settings for higher limits —
+the same workflow keeps working.)
 
 ---
 
 ## Using an existing repo
 
-- Upload the same files into your repo. If you already have a `package.json`, do **not** overwrite it: just add
-  `"@anthropic-ai/sdk": "0.39.0"` under `dependencies` (the runner files use `.mjs`, so `"type": "module"` is not required).
-  The workflow runs `npm install` before Gamma.
-- Gamma uses the folders `.gamma-workspace/` and `artifacts/` as scratch space and never includes them in a PR.
-  If your repo already uses a top-level `artifacts/` folder, rename that folder first.
+- Upload the same files into your repo. If you already have a `package.json`, do **not** overwrite it: add
+  `"openai": "4.104.0"` under `dependencies` (the runner files use `.mjs`, so `"type": "module"` is not required).
+- Gamma uses `.gamma-workspace/` and `artifacts/` as scratch space and never includes them in a PR. If your repo already
+  has a top-level `artifacts/` folder, rename it first.
 - Task files must live inside the repository and end in `.md`.
 
 ---
@@ -193,27 +204,27 @@ Settings → Secrets and variables → Actions → **Variables**:
 
 | Symptom | Fix |
 |---|---|
-| Run fails immediately: "Missing secret" | Step 3 — secret name must be exactly `ANTHROPIC_API_KEY` |
-| `401` from Anthropic | The key is wrong or revoked; create a new one and update the secret |
-| `404 … model not found` | Set the `GAMMA_HAIKU_MODEL` / `GAMMA_SONNET_MODEL` variables to model IDs available to your account |
-| "credit balance is too low" | Add credits in the Anthropic console |
-| Workflow does not appear in Actions | `.github/workflows/gamma.yml` was not uploaded — see the hidden-folder tip in Step 2 |
-| Assigning an issue does nothing | Workflow must exist on the default branch; if you set `GAMMA_ASSIGNEE`, it must equal the assignee's username |
-| "Could not open the pull request" | Step 4: enable *Allow GitHub Actions to create and approve pull requests*. The branch was already pushed — open the compare link printed in the log |
-| Run status "halted" | QA still failed after 2 self-healing rounds. Read `gamma-workspace` → `04-qa-report-*.md`, tighten the task's requirements and completion criteria, and re-run |
+| `401` / `403` from GitHub Models | The workflow must keep `models: read` under `permissions` (it does by default). For **organization** repos, an owner may need to enable GitHub Models for the organization |
+| `404` / "model not found" | Set `GAMMA_FAST_MODEL` / `GAMMA_MAIN_MODEL` to valid IDs (`publisher/name`) from the GitHub Models catalog |
+| "rate limit reached … resets in N minutes" | The free **daily** request cap was hit. Re-run later, pick other models via the variables, or switch provider |
+| Run is slow, log shows `retry 2/8 in 12s` | Normal on the free tier — Gamma waits for the per-minute limit to reset |
+| `413` / "request too large" | Task or files are too big for an 8k window. Split the task; point it at smaller files |
+| Workflow does not appear in Actions | `.github/workflows/gamma.yml` was not uploaded — see the hidden-folder tip in Step 1 |
+| Assigning an issue does nothing | The workflow must exist on the default branch; if you set `GAMMA_ASSIGNEE`, it must equal the assignee's username |
+| "Could not open the pull request" | Step 2: enable *Allow GitHub Actions to create and approve pull requests*. The branch is already pushed — open the compare link printed in the log |
+| Run status "halted" | QA failed after 2 self-healing rounds (or a cap was reached). Read `gamma-workspace` → `04-qa-report-*.md`, tighten the task, re-run |
 | Run status "aborted-dlp" | The secret scanner found something that looks like a credential. Nothing was committed. Remove secrets from the task/inputs and re-run |
 | Stage 2 skipped | Stage 1 did not finish successfully, or `delivery_mode` was `artifact-only` |
-| `git apply` conflict in Stage 2 | Very rare; the patch is built against the exact commit Stage 1 used. Re-run, or apply `gamma.patch` manually |
 
 ---
 
 ## Writing good tasks
 
 - **Goal**: one paragraph, outcome-focused.
-- **Requirements and boundaries**: numbered and testable; include explicit *Do NOT* lines.
+- **Requirements and boundaries**: numbered and testable, with explicit *Do NOT* lines.
 - **Completion criteria**: checkboxes a stranger could verify by reading the files.
-- **Tests**: only commands that already exist in your repo (for example `npm test`). With no tests, write
-  *No automated tests configured; verify by inspection.* Gherkin `.feature` files can be referenced; the QA agent checks them.
-- Small tasks (a few files) work best. Split large projects into several tasks.
+- **Tests**: only commands that already exist in your repo (for example `npm test`). With no tests write
+  *No automated tests configured; verify by inspection.* Gherkin `.feature` files can be referenced; QA checks them.
+- Small tasks work best on the free tier. Split large projects into several tasks.
 
 Happy shipping! 🚀
