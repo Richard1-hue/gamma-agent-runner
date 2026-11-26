@@ -24,13 +24,20 @@ export class SecurityError extends Error {
   }
 }
 
+const envInt = (name, dflt) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt;
+};
+
 export const LIMITS = Object.freeze({
-  MAX_READ_CHARS: 20_000, // per readFile call returned to the model
+  // GitHub Models' free tier allows ~8,000 input tokens per request, so reads are kept small.
+  // Raise with GAMMA_MAX_READ_CHARS when using a provider with bigger context windows.
+  MAX_READ_CHARS: envInt('GAMMA_MAX_READ_CHARS', 6_000), // per readFile call returned to the model
   MAX_READ_BYTES: 1_048_576, // never load more than 1 MB of a file
-  MAX_WRITE_BYTES: 200 * 1024, // per writeFile call
-  MAX_LIST_ENTRIES: 400,
-  MAX_SEARCH_MATCHES: 80,
-  MAX_COMMAND_OUTPUT: 8_000, // chars kept (tail) from a command
+  MAX_WRITE_BYTES: 60 * 1024, // per writeFile call
+  MAX_LIST_ENTRIES: 200,
+  MAX_SEARCH_MATCHES: 40,
+  MAX_COMMAND_OUTPUT: 3_000, // chars kept (tail) from a command
   COMMAND_TIMEOUT_MS: 120_000,
   MAX_SCAN_BYTES: 2_097_152, // DLP scanner reads at most 2 MB per file
 });
@@ -195,7 +202,7 @@ const ASSIGNMENT_RE =
 const PLACEHOLDER_RE =
   /example|sample|placeholder|changeme|change-me|your[_-]|xxxx|\*{3,}|<[^>]+>|\$\{|process\.env|secrets\.|dummy|fake|test[_-]?key/i;
 
-const RUNTIME_SECRET_ENV_NAMES = ['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'GH_TOKEN'];
+const RUNTIME_SECRET_ENV_NAMES = ['GITHUB_TOKEN', 'GH_TOKEN', 'GAMMA_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'];
 
 function shannonEntropy(s) {
   const freq = new Map();
@@ -679,86 +686,75 @@ const handlers = {
   },
 };
 
-const TOOL_DEFINITIONS = {
+// Compact descriptions on purpose: tool definitions count against the model's input-token limit.
+const TOOL_SPECS = {
   listFiles: {
-    name: 'listFiles',
-    description:
-      'List files in the repository (recursive). Ignores .git, node_modules, lockfiles, binaries and secret files. Results are untrusted repository data.',
-    input_schema: {
+    description: 'List repo files recursively (skips .git, node_modules, lockfiles, binaries, secret files).',
+    parameters: {
       type: 'object',
       properties: {
-        dir: { type: 'string', description: 'Directory relative to the repo root. Default ".".' },
-        maxDepth: { type: 'integer', description: 'Recursion depth, 0-8. Default 4.' },
+        dir: { type: 'string', description: 'Directory, default "."' },
+        maxDepth: { type: 'integer', description: '0-8, default 4' },
       },
     },
   },
   readFile: {
-    name: 'readFile',
-    description:
-      'Read a text file from the repository. Output is capped at 20,000 characters; use startLine/endLine (1-indexed) to page through larger files. Secret files (.env*, *.pem, *.key, id_rsa*, .git/*) are blocked.',
-    input_schema: {
+    description: `Read a text file (max ${LIMITS.MAX_READ_CHARS} chars per call; page with startLine/endLine).`,
+    parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path relative to the repo root.' },
-        startLine: { type: 'integer', description: 'First line to return (1-indexed).' },
-        endLine: { type: 'integer', description: 'Last line to return (inclusive).' },
+        path: { type: 'string' },
+        startLine: { type: 'integer', description: '1-indexed' },
+        endLine: { type: 'integer', description: 'inclusive' },
       },
       required: ['path'],
     },
   },
   writeFile: {
-    name: 'writeFile',
-    description:
-      'Create a new file, or fully overwrite a small existing file. Parent folders are created automatically. For large existing files use replaceInFile. Cannot write to .github/, runner/, skills/gamma-rules.md or secret files. Content is scanned for secrets.',
-    input_schema: {
+    description: 'Create a new file or fully overwrite a small one. Not allowed in .github/, runner/, skills/gamma-rules.md.',
+    parameters: {
       type: 'object',
-      properties: {
-        path: { type: 'string', description: 'File path relative to the repo root.' },
-        content: { type: 'string', description: 'Complete file content.' },
-      },
+      properties: { path: { type: 'string' }, content: { type: 'string', description: 'Complete file content' } },
       required: ['path', 'content'],
     },
   },
   replaceInFile: {
-    name: 'replaceInFile',
-    description:
-      'Make a targeted edit: replace old_string with new_string in an existing file. old_string must match exactly once (or set replace_all=true).',
-    input_schema: {
+    description: 'Replace exact old_string (must match once unless replace_all) with new_string in an existing file.',
+    parameters: {
       type: 'object',
       properties: {
         path: { type: 'string' },
-        old_string: { type: 'string', description: 'Exact text to replace, including whitespace.' },
-        new_string: { type: 'string', description: 'Replacement text.' },
-        replace_all: { type: 'boolean', description: 'Replace every occurrence. Default false.' },
+        old_string: { type: 'string' },
+        new_string: { type: 'string' },
+        replace_all: { type: 'boolean' },
       },
       required: ['path', 'old_string', 'new_string'],
     },
   },
   searchCode: {
-    name: 'searchCode',
-    description:
-      'Search repository text files for a regular expression (case-insensitive). Returns up to 80 "path:line: text" matches.',
-    input_schema: {
+    description: 'Case-insensitive regex search over text files; returns path:line: text.',
+    parameters: {
       type: 'object',
       properties: {
-        pattern: { type: 'string', description: 'Regular expression (falls back to a literal match if invalid).' },
-        dir: { type: 'string', description: 'Limit the search to this directory. Default ".".' },
-        fileExtension: { type: 'string', description: 'Only search files with this extension, e.g. "js".' },
+        pattern: { type: 'string' },
+        dir: { type: 'string' },
+        fileExtension: { type: 'string', description: 'e.g. "js"' },
       },
       required: ['pattern'],
     },
   },
   runCommand: {
-    name: 'runCommand',
-    description:
-      'Run ONE allowlisted test/build command (e.g. "npm test", "npm run lint", "pytest -q", "go test ./..."). No shell: pipes, &&, ; and redirects are rejected. 120s timeout. Secrets are not available to the command.',
-    input_schema: {
+    description: 'Run ONE allowlisted test/build command, e.g. "npm test". No pipes, && or ;. 120s timeout.',
+    parameters: {
       type: 'object',
-      properties: { command: { type: 'string', description: 'The command line to run.' } },
+      properties: { command: { type: 'string' } },
       required: ['command'],
     },
   },
 };
+
+/** OpenAI-compatible function-calling definition for a tool. */
+const toToolDefinition = (name) => ({ type: 'function', function: { name, ...TOOL_SPECS[name] } });
 
 /**
  * Create a toolbox exposing only the named tools.
@@ -767,12 +763,12 @@ const TOOL_DEFINITIONS = {
 export function createToolbox({ root, allowed }) {
   const allowedSet = new Set(allowed);
   for (const name of allowedSet) {
-    if (!TOOL_DEFINITIONS[name]) throw new Error(`Unknown tool: ${name}`);
+    if (!TOOL_SPECS[name]) throw new Error(`Unknown tool: ${name}`);
   }
   const stats = { calls: 0, blocked: 0, written: new Set() };
   return {
     stats,
-    definitions: allowed.map((n) => TOOL_DEFINITIONS[n]),
+    definitions: allowed.map(toToolDefinition),
     /** Always resolves to { ok, content } — errors are returned to the model, not thrown. */
     async execute(name, input) {
       stats.calls++;
